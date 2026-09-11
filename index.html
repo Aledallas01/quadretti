@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="description" content="Lavagna a quadretti che riconosce i conti scritti a mano e scrive il risultato dopo l uguale.">
+<meta name="description" content="Lavagna a quadretti che riconosce i conti scritti a mano: variabili, frazioni, esponenti e parentesi.">
 <meta name="theme-color" content="#FAF7F1">
 <title>Quadretti</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -279,7 +279,7 @@ body.tool-eraser #cv{cursor:cell}
 
   <div class="board" id="board">
     <canvas id="cv"></canvas>
-    <div class="hint" id="hint">Scrivi un conto e chiudilo con <code>=</code>&nbsp;: <b>il risultato arriva in rosso</b></div>
+    <div class="hint" id="hint">Chiudi il conto con <code>=</code> e <b>il risultato arriva in rosso</b> &middot; valgono anche <code>x = 2</code>, frazioni e potenze</div>
   </div>
 </div>
 
@@ -514,25 +514,27 @@ function tokenize(s){
   }
   return t;
 }
-function implicitMul(t){
+function known(v, env){ return CONSTS[v] !== undefined || (env && env[v] !== undefined); }
+function implicitMul(t, env){
   var out=[];
   for(var i=0;i<t.length;i++){
     var a = t[i], b = t[i+1];
     out.push(a);
     if(!b) continue;
-    var aEnd = a.t==='num' || (a.t==='id' && CONSTS[a.v]!==undefined) || (a.t==='op' && (a.v===')' || a.v==='!' || a.v==='%'));
+    var aEnd = a.t==='num' || (a.t==='id' && known(a.v, env)) || (a.t==='op' && (a.v===')' || a.v==='!' || a.v==='%'));
     var bStart = b.t==='num' || b.t==='id' || (b.t==='op' && b.v==='(');
     if(aEnd && bStart) out.push({t:'op', v:'*'});
   }
   return out;
 }
 var PREC = {'+':1,'-':1,'*':2,'/':2,'u':3,'^':4};
-function toRPN(t){
+function toRPN(t, env){
   var out=[], ops=[], prev=null;
   for(var i=0;i<t.length;i++){
     var tk = t[i];
     if(tk.t==='num'){ out.push(tk); prev=tk; continue; }
     if(tk.t==='id'){
+      if(env && env[tk.v]!==undefined){ out.push({t:'num', v:env[tk.v]}); prev={t:'num'}; continue; }
       if(CONSTS[tk.v]!==undefined){ out.push({t:'num', v:CONSTS[tk.v]}); prev={t:'num'}; continue; }
       if(!FUNCS[tk.v]) throw new Error('non conosco "'+tk.v+'"');
       ops.push({t:'fn', v:tk.v}); prev=tk; continue;
@@ -596,12 +598,12 @@ function evalRPN(r){
   if(st.length!==1) throw new Error('espressione incompleta');
   return st[0];
 }
-function calc(expr){
+function calc(expr, env){
   try{
     var s = normalizeExpr(expr);
-    if(!s || !/[0-9]/.test(s)) return {ok:false, err:'niente da calcolare'};
+    if(!s || !/[0-9a-z]/i.test(s)) return {ok:false, err:'niente da calcolare'};
     if(s.indexOf('?') >= 0) return {ok:false, err:'lettura incerta'};
-    var v = evalRPN(toRPN(implicitMul(tokenize(s))));
+    var v = evalRPN(toRPN(implicitMul(tokenize(s), env), env));
     if(typeof v !== 'number' || !isFinite(v)) return {ok:false, err:'risultato non valido'};
     return {ok:true, value:v};
   }catch(err){ return {ok:false, err:(err && err.message) || 'errore'}; }
@@ -616,7 +618,8 @@ function fmt(v){
 
 /* ---------------- handwriting recognition ---------------- */
 var RES = 64, N = 16, TEMPLATES = [], DIGIT_RATIO = 0.52;
-var GLYPHS = '0123456789+-=()./x';
+var GLYPHS = '0123456789+-=()./xyabnkm';
+var LETTERS = 'xyabnkm';
 var TFONTS = ['Caveat', 'Archivo', 'Georgia', '"Courier New"', '"Comic Sans MS"', 'system-ui'];
 
 function boxOf(strokes){
@@ -751,14 +754,49 @@ function buildTemplates(){
     }
   }
 }
-function matchFeature(ft){
-  var best = '?', bs = -1;
-  for(var i=0;i<TEMPLATES.length;i++){
-    var b = TEMPLATES[i].ft.g, a = ft.g, s = 0;
-    for(var k=0;k<a.length;k++) s += a[k]*b[k];
-    if(s > bs){ bs = s; best = TEMPLATES[i].ch; }
+/* closed loops in the glyph: 0/6/9 have one, 8 has two, 3/5/2/7 have none.
+   an open loop reads as zero holes, so this only ever rules candidates out when a loop IS closed. */
+function countHoles(m){
+  var vis = new Uint8Array(RES*RES), q = [], i, x, y, j, jx, jy;
+  function open(k){ if(!vis[k] && !m[k]){ vis[k] = 1; q.push(k); } }
+  for(x=0;x<RES;x++){ open(x); open((RES-1)*RES + x); }
+  for(y=0;y<RES;y++){ open(y*RES); open(y*RES + RES-1); }
+  while(q.length){
+    i = q.pop(); x = i%RES; y = (i-x)/RES;
+    if(x > 0) open(i-1);
+    if(x < RES-1) open(i+1);
+    if(y > 0) open(i-RES);
+    if(y < RES-1) open(i+RES);
   }
-  return {ch:best, score:bs};
+  var holes = 0;
+  for(i=0;i<RES*RES;i++){
+    if(m[i] || vis[i]) continue;
+    var size = 0, st = [i];
+    vis[i] = 1;
+    while(st.length){
+      j = st.pop(); size++;
+      jx = j%RES; jy = (j-jx)/RES;
+      if(jx > 0 && !vis[j-1] && !m[j-1]){ vis[j-1] = 1; st.push(j-1); }
+      if(jx < RES-1 && !vis[j+1] && !m[j+1]){ vis[j+1] = 1; st.push(j+1); }
+      if(jy > 0 && !vis[j-RES] && !m[j-RES]){ vis[j-RES] = 1; st.push(j-RES); }
+      if(jy < RES-1 && !vis[j+RES] && !m[j+RES]){ vis[j+RES] = 1; st.push(j+RES); }
+    }
+    if(size >= 9) holes++;
+  }
+  return holes;
+}
+function matchFeature(ft){
+  var bestOf = {}, i, k, ch, s;
+  for(i=0;i<TEMPLATES.length;i++){
+    var b = TEMPLATES[i].ft.g, a = ft.g; s = 0;
+    for(k=0;k<a.length;k++) s += a[k]*b[k];
+    ch = TEMPLATES[i].ch;
+    if(bestOf[ch] === undefined || s > bestOf[ch]) bestOf[ch] = s;
+  }
+  var list = [];
+  for(ch in bestOf){ if(Object.prototype.hasOwnProperty.call(bestOf, ch)) list.push({ch:ch, score:bestOf[ch]}); }
+  list.sort(function(a,b){ return b.score - a.score; });
+  return {ch: list.length ? list[0].ch : '?', score: list.length ? list[0].score : 0, list:list};
 }
 function strokeInfo(st){
   var b = boxOf([st]), p = st.pts, len = 0;
@@ -767,70 +805,148 @@ function strokeInfo(st){
   var chord = Math.hypot(last.x-first.x, last.y-first.y);
   return {b:b, len:len, chord:chord, straight: len > 0.001 ? chord/len : 1, dx:last.x-first.x, dy:last.y-first.y};
 }
-function classify(sym, lineH){
+/* how far the stroke leaves its own chord, per side, oriented top-to-bottom:
+   a "(" bulges left and never right, a "1" barely leaves the chord at all */
+function bulge(st){
+  var p = st.pts; if(p.length < 3) return {left:0, right:0};
+  var a = p[0], z = p[p.length-1];
+  var dx = z.x-a.x, dy = z.y-a.y, len = Math.hypot(dx, dy);
+  if(len < 1) return {left:0, right:0};
+  var sgn = dy < 0 ? -1 : 1, L = 0, R = 0;
+  for(var i=1;i<p.length-1;i++){
+    var cr = sgn * (dx*(p[i].y-a.y) - dy*(p[i].x-a.x)) / len;
+    if(cr > L) L = cr;
+    if(-cr > R) R = -cr;
+  }
+  return {left:L, right:R};
+}
+function classify(sym, refH){
   var sts = sym.items.map(function(i){ return i.st; });
   var b = sym.b, n = sts.length;
   var infos = sts.map(strokeInfo);
-  if(n === 1 && Math.max(b.w, b.h) < lineH*0.26) return '.';
+  function firm(ch, extra){
+    var o = {ch:ch, score:1, list:[], firm:true};
+    if(extra) for(var k in extra) o[k] = extra[k];
+    return o;
+  }
+  if(n === 1 && Math.max(b.w, b.h) < refH*0.26) return firm('.');
   var flats = [], verts = [], tiny = [];
   infos.forEach(function(i){
     if(i.b.w > 2.2*i.b.h && i.straight > 0.8) flats.push(i);
     if(i.b.h > 2.2*i.b.w && i.straight > 0.8) verts.push(i);
-    if(Math.max(i.b.w, i.b.h) < lineH*0.3) tiny.push(i);
+    if(Math.max(i.b.w, i.b.h) < refH*0.3) tiny.push(i);
   });
   if(n === 2 && flats.length === 2){
     var c0 = infos[0].b.y + infos[0].b.h/2, c1 = infos[1].b.y + infos[1].b.h/2;
-    if(Math.abs(c0-c1) > 0.1*lineH) return '=';
+    if(Math.abs(c0-c1) > 0.1*refH) return firm('=');
   }
-  if(n === 3 && flats.length === 1 && tiny.length === 2) return '/';
+  if(n === 3 && flats.length === 1 && tiny.length === 2) return firm('/');
   if(n === 2 && flats.length === 1 && verts.length === 1){
     var fl = flats[0], vr = verts[0];
     var vx = vr.b.x + vr.b.w/2, fy = fl.b.y + fl.b.h/2;
-    if(vx > fl.b.x - 2 && vx < fl.b.x2 + 2 && fy > vr.b.y - 2 && fy < vr.b.y2 + 2) return '+';
+    if(vx > fl.b.x - 2 && vx < fl.b.x2 + 2 && fy > vr.b.y - 2 && fy < vr.b.y2 + 2) return firm('+');
   }
   if(n === 2 && !flats.length && !verts.length){
     var s0 = infos[0].dy/(infos[0].dx || 0.001), s1 = infos[1].dy/(infos[1].dx || 0.001);
-    if(infos[0].straight > 0.78 && infos[1].straight > 0.78 && s0*s1 < 0 && Math.abs(s0) > 0.3 && Math.abs(s1) > 0.3) return '*';
+    if(infos[0].straight > 0.78 && infos[1].straight > 0.78 && s0*s1 < 0 && Math.abs(s0) > 0.3 && Math.abs(s1) > 0.3){
+      return firm('*', {xshape:true});
+    }
   }
   if(n === 1){
-    if(b.w > 2.4*b.h && infos[0].straight > 0.85) return '-';
-    if(b.h > 2.6*b.w && infos[0].straight > 0.88) return '1';
+    if(b.w > 2.4*b.h && infos[0].straight > 0.85) return firm('-');
+    if(b.h > 1.6*b.w && infos[0].straight > 0.72){
+      var bg = bulge(sts[0]), side = Math.max(bg.left, bg.right), other = Math.min(bg.left, bg.right);
+      if(side > 0.16*b.h && other < side*0.35) return firm(bg.left > bg.right ? '(' : ')');
+    }
+    if(b.h > 2.6*b.w && infos[0].straight > 0.88) return firm('1');
   }
-  var ft = featureFromMask(maskFromStrokes(sts));
-  if(!ft) return '?';
-  var m = matchFeature(ft);
-  return m.score > 0.45 ? m.ch : '?';
+  var mask = maskFromStrokes(sts);
+  var ft = featureFromMask(mask);
+  if(!ft) return {ch:'?', score:0, list:[]};
+  var m = matchFeature(ft), pick = m.list.length ? m.list[0] : {ch:'?', score:0};
+  var hs = countHoles(mask);
+  if(hs >= 1){
+    var allowed = hs >= 2 ? '8' : '0469';
+    for(var i=0;i<m.list.length;i++){
+      if(allowed.indexOf(m.list[i].ch) >= 0){ pick = m.list[i]; break; }
+    }
+  }
+  return {ch: pick.score > 0.45 ? pick.ch : '?', score:pick.score, list:m.list, xshape: pick.ch === 'x'};
 }
-function segment(){
+
+/* ---------------- layout: rows, fractions, groups ---------------- */
+function leafBoxes(list, out){
+  out = out || [];
+  for(var i=0;i<list.length;i++){
+    var s = list[i];
+    if(s.frac){ leafBoxes(s.num, out); leafBoxes(s.den, out); }
+    else out.push(s.b);
+  }
+  return out;
+}
+function refHeight(list){
+  var hs = leafBoxes(list).map(function(b){ return b.h; }).sort(function(a,b){ return a-b; });
+  if(!hs.length) return 12;
+  var mx = hs[hs.length-1];
+  var tall = hs.filter(function(h){ return h > mx*0.45; });
+  return Math.max(6, tall.length ? tall[Math.floor(tall.length/2)] : mx);
+}
+function buildRows(){
   var ink = S.strokes.filter(function(st){ return !st.hl; });
   if(!ink.length) return [];
   var items = ink.map(function(st){ return {st:st, b:boxOf([st])}; });
-  items.sort(function(a,b){ return a.b.y - b.b.y; });
-  var lines = [];
+  /* tallest first, so the body of a line anchors its row and small marks
+     (exponents, dots, operators) attach to the row they belong to */
+  items.sort(function(a,b){ return b.b.h - a.b.h; });
+  var rows = [];
   items.forEach(function(it){
     var best = null, bestDist = Infinity;
     var itC = (it.b.y + it.b.y2)/2;
-    for(var i=0;i<lines.length;i++){
-      var L = lines[i];
+    for(var i=0;i<rows.length;i++){
+      var L = rows[i];
       var ov = Math.min(it.b.y2, L.y2) - Math.max(it.b.y, L.y);
       if(ov <= 0) continue;
-      var r = ov / Math.max(1, Math.min(it.b.h, L.y2 - L.y));
-      if(r <= 0.4) continue;
+      var rowH = L.y2 - L.y;
+      var r = ov / Math.max(1, Math.min(it.b.h, rowH));
+      var small = it.b.h <= 0.72*rowH;
+      if(r <= (small ? 0.25 : 0.4)) continue;
+      /* a row is a line of writing, not a band across the whole board:
+         something far off to the side belongs to its own line */
+      var lim = 2.2*Math.max(rowH, it.b.h);
+      if(it.b.x - L.x2 > lim || L.x - it.b.x2 > lim) continue;
       var dist = Math.abs(itC - (L.y + L.y2)/2);
       if(dist < bestDist){ bestDist = dist; best = L; }
     }
-    if(!best){ best = {y:it.b.y, y2:it.b.y2, items:[]}; lines.push(best); }
+    if(!best){ best = {y:it.b.y, y2:it.b.y2, x:it.b.x, x2:it.b.x2, items:[]}; rows.push(best); }
     best.items.push(it);
     best.y = Math.min(best.y, it.b.y); best.y2 = Math.max(best.y2, it.b.y2);
+    best.x = Math.min(best.x, it.b.x); best.x2 = Math.max(best.x2, it.b.x2);
   });
-  var groups = [];
-  lines.forEach(function(L){
-    var hs = L.items.map(function(i){ return i.b.h; }).sort(function(a,b){ return a-b; });
-    var maxh = hs[hs.length-1];
-    var tall = hs.filter(function(h){ return h > maxh*0.45; });
-    var lineH = tall.length ? tall[Math.floor(tall.length/2)] : maxh;
+  /* the pass above can leave one line of writing split in two, when its widest
+     marks were placed before the ones that bridge them: glue those back together */
+  var fused = true;
+  while(fused){
+    fused = false;
+    for(var i=0;i<rows.length && !fused;i++){
+      for(var j=i+1;j<rows.length && !fused;j++){
+        var A = rows[i], B = rows[j];
+        var ov = Math.min(A.y2, B.y2) - Math.max(A.y, B.y);
+        if(ov <= 0) continue;
+        var hA = A.y2 - A.y, hB = B.y2 - B.y;
+        if(ov <= 0.35*Math.min(hA, hB)) continue;
+        var lim2 = 2.2*Math.max(hA, hB);
+        if(B.x - A.x2 > lim2 || A.x - B.x2 > lim2) continue;
+        A.items = A.items.concat(B.items);
+        A.y = Math.min(A.y, B.y); A.y2 = Math.max(A.y2, B.y2);
+        A.x = Math.min(A.x, B.x); A.x2 = Math.max(A.x2, B.x2);
+        rows.splice(j, 1);
+        fused = true;
+      }
+    }
+  }
+  rows.forEach(function(L){
     var its = L.items.slice().sort(function(a,b){ return a.b.x - b.b.x; });
-    var syms = [], lineGroups = [];
+    var syms = [];
     its.forEach(function(it){
       for(var i=0;i<syms.length;i++){
         var s = syms[i];
@@ -840,28 +956,207 @@ function segment(){
       syms.push({items:[it], b:it.b});
     });
     syms.sort(function(a,b){ return a.b.x - b.b.x; });
-    var cur = [];
+    var refH = refHeight(syms);
+    syms.forEach(function(s){
+      var c = classify(s, refH);
+      s.ch = c.ch; s.alts = c.list || []; s.firm = !!c.firm; s.xshape = !!c.xshape;
+    });
+    L.syms = syms; L.refH = refH;
+  });
+  rows.sort(function(a,b){ return (a.y + a.y2) - (b.y + b.y2); });
+  return rows;
+}
+/* one side of a candidate fraction bar: the nearest cluster of symbols centred on it */
+function fracSide(rows, bar, row, dir){
+  var x1 = bar.x - bar.w*0.2, x2 = bar.x2 + bar.w*0.2, cands = [];
+  rows.forEach(function(L){
+    if(L === row) return;
+    L.syms.forEach(function(s){
+      if(s.used) return;
+      var c = (s.b.x + s.b.x2)/2;
+      if(c < x1 || c > x2) return;
+      var gap = dir < 0 ? (bar.y - s.b.y2) : (s.b.y - bar.y2);
+      if(gap < -bar.h) return;
+      cands.push({s:s, gap:Math.max(0, gap), h:s.b.h});
+    });
+  });
+  if(!cands.length) return null;
+  cands.sort(function(a,b){ return a.gap - b.gap; });
+  var near = cands[0];
+  if(near.gap > Math.max(near.h*0.65, 6)) return null;
+  var list = cands.filter(function(c){ return c.gap <= near.gap + near.h*0.9; }).map(function(c){ return c.s; });
+  if(list.some(function(s){ return !s.frac && s.ch === '='; })) return null;
+  list.sort(function(a,b){ return a.b.x - b.b.x; });
+  var box = list[0].b;
+  list.forEach(function(s){ box = unionBox(box, s.b); });
+  if(box.w > bar.w*1.6) return null;
+  if(bar.w < box.w*0.85) return null;
+  if(Math.abs((box.x+box.x2)/2 - (bar.x+bar.x2)/2) > bar.w*0.32) return null;
+  return {list:list, box:box};
+}
+function buildFractions(rows){
+  var bars = [];
+  rows.forEach(function(L){
+    L.syms.forEach(function(s){
+      if(s.items.length !== 1 || s.frac) return;
+      if(s.b.w < 2.2*s.b.h || s.b.w < L.refH*0.5) return;
+      if(strokeInfo(s.items[0].st).straight < 0.85) return;
+      bars.push({s:s, row:L});
+    });
+  });
+  bars.sort(function(a,b){ return a.s.b.w - b.s.b.w; });
+  bars.forEach(function(B){
+    if(B.s.used) return;
+    var bar = B.s.b;
+    var num = fracSide(rows, bar, B.row, -1);
+    if(!num) return;
+    var den = fracSide(rows, bar, B.row, 1);
+    if(!den) return;
+    var node = {
+      frac:true, num:num.list, den:den.list, ch:'#',
+      b: unionBox(unionBox(bar, num.box), den.box)
+    };
+    num.list.concat(den.list).forEach(function(s){ s.used = true; });
+    B.s.used = true;
+    var arr = B.row.syms, at = arr.indexOf(B.s);
+    if(at >= 0) arr[at] = node;
+    rows.forEach(function(L){
+      L.syms = L.syms.filter(function(s){ return s === node || !s.used; });
+    });
+  });
+  rows.forEach(function(L){
+    L.syms = L.syms.filter(function(s){ return !s.used; });
+    L.syms.sort(function(a,b){ return a.b.x - b.b.x; });
+  });
+}
+function setAnchor(grp){
+  grp.lineH = refHeight(grp.symbols);
+  var hasFrac = grp.symbols.some(function(s){ return s.frac; });
+  var eq = null;
+  grp.symbols.forEach(function(s){ if(!s.frac && s.ch === '=') eq = s; });
+  if(hasFrac && eq){ grp.baseline = (eq.b.y + eq.b.y2)/2 + grp.lineH*0.5; return; }
+  var bases = grp.symbols.filter(function(s){ return !s.frac && s.b.h > 0.5*grp.lineH; })
+    .map(function(s){ return s.b.y2; }).sort(function(a,b){ return a-b; });
+  grp.baseline = bases.length ? bases[Math.floor(bases.length/2)] : grp.box.y2;
+}
+function segment(){
+  var rows = buildRows();
+  if(!rows.length) return [];
+  buildFractions(rows);
+  var groups = [];
+  rows.forEach(function(L){
+    var items = L.syms;
+    if(!items.length) return;
+    var refH = refHeight(items);
+    var cur = [], mine = [];
     function flush(){
       if(!cur.length) return;
       var box = cur[0].b;
       cur.forEach(function(s){ box = unionBox(box, s.b); });
-      var bases = cur.filter(function(s){ return s.b.h > 0.5*lineH; }).map(function(s){ return s.b.y2; }).sort(function(a,b){ return a-b; });
-      var baseline = bases.length ? bases[Math.floor(bases.length/2)] : box.y2;
-      cur.forEach(function(s){ s.ch = classify(s, lineH); });
-      lineGroups.push({symbols:cur, box:box, lineH:lineH, baseline:baseline, nextX:Infinity});
+      mine.push({symbols:cur, box:box, lineH:refH, baseline:box.y2, nextX:Infinity});
       cur = [];
     }
-    for(var i=0;i<syms.length;i++){
-      if(cur.length && syms[i].b.x - cur[cur.length-1].b.x2 > 1.7*lineH) flush();
-      cur.push(syms[i]);
+    for(var i=0;i<items.length;i++){
+      if(cur.length && items[i].b.x - cur[cur.length-1].b.x2 > 1.7*refH) flush();
+      cur.push(items[i]);
     }
     flush();
-    for(var k=0;k<lineGroups.length;k++){
-      if(lineGroups[k+1]) lineGroups[k].nextX = lineGroups[k+1].box.x;
-      groups.push(lineGroups[k]);
+    for(var k=0;k<mine.length;k++){
+      setAnchor(mine[k]);
+      groups.push(mine[k]);
     }
   });
+  /* how much room an answer has: the nearest thing written to the right, on any line that shares this band */
+  groups.forEach(function(g){
+    var nx = Infinity;
+    groups.forEach(function(o){
+      if(o === g || o.box.x <= g.box.x2) return;
+      var ov = Math.min(g.box.y2, o.box.y2) - Math.max(g.box.y, o.box.y);
+      if(ov <= Math.min(g.box.h, o.box.h)*0.25) return;
+      if(o.box.x < nx) nx = o.box.x;
+    });
+    g.nextX = nx;
+  });
   return groups;
+}
+
+/* ---------------- layout: symbols to expression ---------------- */
+function altNonLetter(s){
+  var list = s.alts || [];
+  for(var i=0;i<list.length;i++){
+    if(LETTERS.indexOf(list[i].ch) < 0 && list[i].score > 0.45) return list[i].ch;
+  }
+  return '?';
+}
+/* letters only survive where they make sense: as the name being defined, or once defined elsewhere.
+   an x-shape between two values is a multiplication, not the variable x. */
+function resolveSeq(items, env, assignHead){
+  var chs = items.map(function(s){ return s.frac ? '#' : s.ch; });
+  for(var i=0;i<items.length;i++){
+    var s = items[i];
+    if(s.frac){ resolveSeq(s.num, env, false); resolveSeq(s.den, env, false); continue; }
+    var ch = s.ch, prev = chs[i-1] || '', next = chs[i+1] || '';
+    if(s.xshape){
+      if(/[0-9.)]/.test(prev) && /[0-9.(#]/.test(next)) ch = '*';
+      else if(assignHead && i === 0) ch = 'x';
+      else if(env && env.x !== undefined) ch = 'x';
+      else ch = '*';
+    } else if(ch.length === 1 && LETTERS.indexOf(ch) >= 0){
+      var keep = (assignHead && i === 0) || (env && env[ch] !== undefined);
+      if(!keep) ch = altNonLetter(s);
+    }
+    s.rch = ch;
+  }
+}
+function canSup(s, base, refH){
+  if(!base) return false;
+  var ch = s.frac ? '#' : s.rch;
+  if(!s.frac && !/^[0-9a-z.()]$/.test(ch)) return false;
+  if(s.b.h > base.h*0.85) return false;
+  if(s.b.y2 > base.y + base.h*0.62) return false;
+  if(s.b.x < base.x2 - base.w*0.25) return false;
+  if(s.b.x - base.x2 > refH*0.9) return false;
+  return true;
+}
+function wrapIf(d){ return /[+\-*\/^]/.test(d) ? '(' + d + ')' : d; }
+function buildExpr(items, refH){
+  var expr = '', disp = '', i = 0, base = null;
+  while(i < items.length){
+    var s = items[i];
+    if(canSup(s, base, refH)){
+      var run = [];
+      while(i < items.length && canSup(items[i], base, refH)){ run.push(items[i]); i++; }
+      var r = buildExpr(run, refH*0.8);
+      expr += '^(' + r.expr + ')';
+      disp += '^' + (run.length > 1 ? '(' + r.disp + ')' : r.disp);
+      continue;
+    }
+    if(s.frac){
+      var nu = buildExpr(s.num, refHeight(s.num)), de = buildExpr(s.den, refHeight(s.den));
+      expr += '(' + nu.expr + ')/(' + de.expr + ')';
+      disp += wrapIf(nu.disp) + '/' + wrapIf(de.disp);
+    } else {
+      expr += s.rch; disp += s.rch;
+    }
+    base = s.b; i++;
+  }
+  return {expr:expr, disp:disp};
+}
+function parseGroup(grp, env){
+  var items = grp.symbols;
+  var assignHead = items.length >= 2 && !items[0].frac && !items[1].frac &&
+    (items[0].xshape || (items[0].ch.length === 1 && LETTERS.indexOf(items[0].ch) >= 0)) &&
+    items[1].ch === '=';
+  resolveSeq(items, env, assignHead);
+  var b = buildExpr(items, grp.lineH);
+  var at = b.expr.lastIndexOf('='), atD = b.disp.lastIndexOf('=');
+  if(at < 0) return null;
+  var lhs = b.expr.slice(0, at), rhs = b.expr.slice(at+1);
+  var dispL = atD >= 0 ? b.disp.slice(0, atD) : b.disp;
+  if(assignHead && /^[a-z]$/.test(lhs) && rhs.replace(/\s/g, '')){
+    return {grp:grp, assign:lhs, rhs:rhs, disp:b.disp};
+  }
+  return {grp:grp, lhs:lhs, rhs:rhs, disp:b.disp, dispL:dispL};
 }
 function measureDigitRatio(){
   try{
@@ -897,25 +1192,47 @@ function scheduleAuto(){
   clearTimeout(autoT);
   autoT = setTimeout(solve, 1100);
 }
+function sameEnv(a, b){
+  var ka = Object.keys(a), kb = Object.keys(b);
+  if(ka.length !== kb.length) return false;
+  for(var i=0;i<ka.length;i++) if(a[ka[i]] !== b[ka[i]]) return false;
+  return true;
+}
 function solve(){
   buildTemplates();
-  var groups = segment(), answers = [], read = [];
-  groups.forEach(function(grp){
-    var expr = grp.symbols.map(function(s){ return s.ch; }).join('');
-    var at = expr.lastIndexOf('=');
-    if(at < 0) return;
-    var lhs = expr.slice(0, at), rhs = expr.slice(at+1);
-    if(!/[0-9]/.test(lhs)) return;
-    var res = calc(lhs);
-    if(!res.ok) return;
+  var groups = segment(), parsed = [], env = {};
+  for(var round=0; round<4; round++){
+    parsed = groups.map(function(g){ return parseGroup(g, env); });
+    var next = {};
+    parsed.forEach(function(p){
+      if(!p || !p.assign) return;
+      var v = calc(p.rhs, env);
+      if(v.ok) next[p.assign] = v.value;
+    });
+    if(sameEnv(next, env)) break;
+    env = next;
+  }
+  var answers = [], read = [];
+  parsed.forEach(function(p){
+    if(!p) return;
+    if(p.assign){
+      if(env[p.assign] !== undefined) read.push(p.assign + ' = ' + fmt(env[p.assign]));
+      return;
+    }
+    if(!/[0-9a-z]/.test(p.lhs)) return;
+    var res = calc(p.lhs, env);
+    if(!res.ok){
+      if(res.err && res.err.indexOf('non conosco') === 0) read.push(p.dispL + '= ?');
+      return;
+    }
     var text = fmt(res.value);
-    if(rhs.replace(/\s/g,'')){
-      var ru = calc(rhs);
+    if(p.rhs.replace(/\s/g, '')){
+      var ru = calc(p.rhs, env);
       if(!ru.ok) return;
-      if(Math.abs(ru.value - res.value) <= 1e-9*Math.max(1, Math.abs(res.value))) answers.push(place(grp, '', 'ok'));
-      else answers.push(place(grp, text, 'bad'));
-    } else answers.push(place(grp, text, 'val'));
-    read.push(expr + ' ' + text);
+      if(Math.abs(ru.value - res.value) <= 1e-9*Math.max(1, Math.abs(res.value))) answers.push(place(p.grp, '', 'ok'));
+      else answers.push(place(p.grp, text, 'bad'));
+    } else answers.push(place(p.grp, text, 'val'));
+    read.push(p.dispL + '= ' + text);
   });
   S.answers = answers;
   updateHint(read);
@@ -926,10 +1243,9 @@ function updateHint(list){
   if(!list || !list.length){ hintEl.innerHTML = TIP; hintEl.hidden = S.strokes.length > 0; return; }
   hintEl.hidden = false;
   hintEl.innerHTML = '<b>Ho letto</b> ' + list.slice(-3).map(function(x){
-    return '<code>' + x.replace(/\*/g, '×').replace(/\//g, '÷') + '</code>';
+    return '<code>' + x.replace(/\*/g, '×') + '</code>';
   }).join(' · ');
 }
-
 /* ---------------- export ---------------- */
 var DL = null;
 function exportPNG(){
