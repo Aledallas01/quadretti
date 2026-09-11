@@ -178,7 +178,10 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
   content:""; position:absolute; top:0; bottom:0; left:72px; width:1px;
   background:var(--margin-line); pointer-events:none;
 }
-#cv{position:absolute; inset:0; width:100%; height:100%; display:block; cursor:crosshair}
+#cv{
+  position:absolute; inset:0; width:100%; height:100%; display:block; cursor:crosshair;
+  touch-action:none; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;
+}
 body.tool-eraser #cv{cursor:cell}
 
 .hint{
@@ -204,10 +207,17 @@ body.tool-eraser #cv{cursor:cell}
 @media (max-width:620px){
   .tb-actions .label{display:none}
   .brand .sub{display:none}
+  .brand h1{font-size:17px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .topbar{gap:8px; padding:8px 10px}
+  .tbtn{padding:9px 10px}
   .rail{width:54px}
   .rail .tool{width:40px;height:40px}
   .rail .cap{display:none}
-  .hint{display:none}
+  .hint{font-size:11.5px; padding:5px 11px; bottom:10px; max-width:calc(100% - 20px)}
+}
+@media (max-width:470px){
+  .brand{display:none}
+  .tb-actions{flex:1 1 auto; justify-content:space-between; gap:4px}
 }
 @media (prefers-reduced-motion:reduce){
   *{transition:none !important; animation:none !important}
@@ -433,6 +443,9 @@ function pos(e){ var r = cv.getBoundingClientRect(); return {x:e.clientX-r.left,
 board.addEventListener('pointerdown', function(e){
   if(e.target !== cv) return;
   if(e.pointerType==='mouse' && e.button!==0) return;
+  if(e.isPrimary === false) return;  /* a second finger must not hijack the stroke */
+  if(drawing || erasing) endDraw();  /* a lost pointerup must not block the next stroke */
+  e.preventDefault();
   var p = pos(e);
   try{ cv.setPointerCapture(e.pointerId); }catch(err){}
   if(S.tool==='eraser'){ pushHistory(); erasing = true; eraseAt(p); return; }
@@ -832,13 +845,15 @@ function classify(sym, refH){
   if(n === 1 && Math.max(b.w, b.h) < refH*0.26) return firm('.');
   var flats = [], verts = [], tiny = [];
   infos.forEach(function(i){
-    if(i.b.w > 2.2*i.b.h && i.straight > 0.8) flats.push(i);
+    if(i.b.w > 1.9*i.b.h && i.straight > 0.78) flats.push(i);
     if(i.b.h > 2.2*i.b.w && i.straight > 0.8) verts.push(i);
     if(Math.max(i.b.w, i.b.h) < refH*0.3) tiny.push(i);
   });
   if(n === 2 && flats.length === 2){
-    var c0 = infos[0].b.y + infos[0].b.h/2, c1 = infos[1].b.y + infos[1].b.h/2;
-    if(Math.abs(c0-c1) > 0.1*refH) return firm('=');
+    var f0 = flats[0].b, f1 = flats[1].b;
+    var c0 = f0.y + f0.h/2, c1 = f1.y + f1.h/2;
+    var ovx = Math.min(f0.x2, f1.x2) - Math.max(f0.x, f1.x);
+    if(Math.abs(c0-c1) > Math.max(2, 0.06*refH) && ovx > 0.25*Math.min(f0.w, f1.w)) return firm('=');
   }
   if(n === 3 && flats.length === 1 && tiny.length === 2) return firm('/');
   if(n === 2 && flats.length === 1 && verts.length === 1){
@@ -891,49 +906,77 @@ function refHeight(list){
   var tall = hs.filter(function(h){ return h > mx*0.45; });
   return Math.max(6, tall.length ? tall[Math.floor(tall.length/2)] : mx);
 }
-function buildRows(){
-  var ink = S.strokes.filter(function(st){ return !st.hl; });
-  if(!ink.length) return [];
-  var items = ink.map(function(st){ return {st:st, b:boxOf([st])}; });
-  /* tallest first, so the body of a line anchors its row and small marks
-     (exponents, dots, operators) attach to the row they belong to */
-  items.sort(function(a,b){ return b.b.h - a.b.h; });
+function boxHeights(list){
+  var hs = list.map(function(o){ return o.b.h; }).sort(function(a,b){ return a-b; });
+  if(!hs.length) return 12;
+  var mx = hs[hs.length-1];
+  var tall = hs.filter(function(h){ return h > mx*0.45; });
+  return Math.max(6, tall.length ? tall[Math.floor(tall.length/2)] : mx);
+}
+/* writing directly above AND below a mark, aligned with it: that is a fraction bar */
+function sandwiched(it, rowH, items){
+  var reach = Math.max(12, 0.9*rowH), above = false, below = false;
+  for(var k=0;k<items.length;k++){
+    var o = items[k];
+    if(o === it) continue;
+    var c = (o.b.x + o.b.x2)/2;
+    if(c < it.b.x || c > it.b.x2) continue;
+    var gUp = it.b.y - o.b.y2, gDn = o.b.y - it.b.y2;
+    if(gUp >= 0 && gUp <= reach) above = true;
+    if(gDn >= 0 && gDn <= reach) below = true;
+    if(above && below) return true;
+  }
+  return false;
+}
+/* group anything with a box into lines of writing: vertical band plus horizontal
+   proximity, so two columns side by side never share a line */
+function clusterRows(items){
+  if(!items.length) return [];
+  var sorted = items.slice().sort(function(a,b){ return b.b.h - a.b.h; });
   var rows = [];
-  items.forEach(function(it){
-    var best = null, bestDist = Infinity;
+  sorted.forEach(function(it){
+    var best = null, bestDist = Infinity, near = null, nearGap = Infinity;
     var itC = (it.b.y + it.b.y2)/2;
     for(var i=0;i<rows.length;i++){
       var L = rows[i];
-      var ov = Math.min(it.b.y2, L.y2) - Math.max(it.b.y, L.y);
-      if(ov <= 0) continue;
       var rowH = L.y2 - L.y;
-      var r = ov / Math.max(1, Math.min(it.b.h, rowH));
-      var small = it.b.h <= 0.72*rowH;
-      if(r <= (small ? 0.25 : 0.4)) continue;
-      /* a row is a line of writing, not a band across the whole board:
-         something far off to the side belongs to its own line */
       var lim = 2.2*Math.max(rowH, it.b.h);
       if(it.b.x - L.x2 > lim || L.x - it.b.x2 > lim) continue;
-      var dist = Math.abs(itC - (L.y + L.y2)/2);
-      if(dist < bestDist){ bestDist = dist; best = L; }
+      var ov = Math.min(it.b.y2, L.y2) - Math.max(it.b.y, L.y);
+      if(ov > 0){
+        var r = ov / Math.max(1, Math.min(it.b.h, rowH));
+        var small = it.b.h <= 0.72*rowH;
+        if(r <= (small ? 0.25 : 0.4)) continue;
+        var dist = Math.abs(itC - (L.y + L.y2)/2);
+        if(dist < bestDist){ bestDist = dist; best = L; }
+      } else if(it.b.h <= 0.5*rowH){
+        /* a small mark written just under (or over) a line still belongs to it:
+           the lower bar of "=" often lands below the digits.
+           a mark with writing on both sides is a fraction bar instead — leave it alone */
+        var vgap = Math.max(L.y - it.b.y2, it.b.y - L.y2);
+        if(vgap > 0.35*rowH || vgap >= nearGap) continue;
+        if(sandwiched(it, rowH, items)) continue;
+        nearGap = vgap; near = L;
+      }
     }
+    if(!best) best = near;
     if(!best){ best = {y:it.b.y, y2:it.b.y2, x:it.b.x, x2:it.b.x2, items:[]}; rows.push(best); }
     best.items.push(it);
     best.y = Math.min(best.y, it.b.y); best.y2 = Math.max(best.y2, it.b.y2);
     best.x = Math.min(best.x, it.b.x); best.x2 = Math.max(best.x2, it.b.x2);
   });
-  /* the pass above can leave one line of writing split in two, when its widest
-     marks were placed before the ones that bridge them: glue those back together */
+  /* the pass above can leave one line split in two, when its widest marks were
+     placed before the ones that bridge them: glue those back together */
   var fused = true;
   while(fused){
     fused = false;
     for(var i=0;i<rows.length && !fused;i++){
       for(var j=i+1;j<rows.length && !fused;j++){
         var A = rows[i], B = rows[j];
-        var ov = Math.min(A.y2, B.y2) - Math.max(A.y, B.y);
-        if(ov <= 0) continue;
+        var ov2 = Math.min(A.y2, B.y2) - Math.max(A.y, B.y);
+        if(ov2 <= 0) continue;
         var hA = A.y2 - A.y, hB = B.y2 - B.y;
-        if(ov <= 0.35*Math.min(hA, hB)) continue;
+        if(ov2 <= 0.35*Math.min(hA, hB)) continue;
         var lim2 = 2.2*Math.max(hA, hB);
         if(B.x - A.x2 > lim2 || A.x - B.x2 > lim2) continue;
         A.items = A.items.concat(B.items);
@@ -944,41 +987,84 @@ function buildRows(){
       }
     }
   }
-  rows.forEach(function(L){
-    var its = L.items.slice().sort(function(a,b){ return a.b.x - b.b.x; });
-    var syms = [];
-    its.forEach(function(it){
-      for(var i=0;i<syms.length;i++){
-        var s = syms[i];
-        var ov = Math.min(it.b.x2, s.b.x2) - Math.max(it.b.x, s.b.x);
-        if(ov > 0.45*Math.min(it.b.w, s.b.w)){ s.items.push(it); s.b = unionBox(s.b, it.b); return; }
-      }
-      syms.push({items:[it], b:it.b});
-    });
-    syms.sort(function(a,b){ return a.b.x - b.b.x; });
-    var refH = refHeight(syms);
-    syms.forEach(function(s){
-      var c = classify(s, refH);
-      s.ch = c.ch; s.alts = c.list || []; s.firm = !!c.firm; s.xshape = !!c.xshape;
-    });
-    L.syms = syms; L.refH = refH;
-  });
+  rows.forEach(function(L){ L.items.sort(function(a,b){ return a.b.x - b.b.x; }); });
   rows.sort(function(a,b){ return (a.y + a.y2) - (b.y + b.y2); });
   return rows;
 }
-/* one side of a candidate fraction bar: the nearest cluster of symbols centred on it */
-function fracSide(rows, bar, row, dir){
-  var x1 = bar.x - bar.w*0.2, x2 = bar.x2 + bar.w*0.2, cands = [];
-  rows.forEach(function(L){
-    if(L === row) return;
-    L.syms.forEach(function(s){
-      if(s.used) return;
-      var c = (s.b.x + s.b.x2)/2;
-      if(c < x1 || c > x2) return;
-      var gap = dir < 0 ? (bar.y - s.b.y2) : (s.b.y - bar.y2);
-      if(gap < -bar.h) return;
-      cands.push({s:s, gap:Math.max(0, gap), h:s.b.h});
+function isFlatBox(b){ return b.w > 1.9*Math.max(1, b.h); }
+function flatSym(s, refH){
+  if(s.frac || s.items.length !== 1) return false;
+  if(s.b.w < refH*0.22 || !isFlatBox(s.b)) return false;
+  return strokeInfo(s.items[0].st).straight > 0.78;
+}
+/* two short bars stacked on top of each other are an "=", even when the hand
+   left them offset or of different lengths — which is the norm with a fingertip */
+function fuseEquals(syms, refH){
+  for(var i=0;i<syms.length;i++){
+    var a = syms[i];
+    if(!flatSym(a, refH)) continue;
+    for(var j=i+1;j<syms.length;j++){
+      var b = syms[j];
+      if(!flatSym(b, refH)) continue;
+      var ovx = Math.min(a.b.x2, b.b.x2) - Math.max(a.b.x, b.b.x);
+      if(ovx < 0.25*Math.min(a.b.w, b.b.w)) continue;
+      var dy = Math.abs((a.b.y + a.b.y2)/2 - (b.b.y + b.b.y2)/2);
+      if(dy < 0.04*refH || dy > 0.6*refH) continue;
+      if(Math.max(a.b.w, b.b.w) > 2.4*Math.min(a.b.w, b.b.w)) continue;
+      a.items = a.items.concat(b.items);
+      a.b = unionBox(a.b, b.b);
+      syms.splice(j, 1); j--;
+    }
+  }
+}
+/* strokes of one symbol overlap horizontally and either overlap vertically or are
+   two flat bars ("="): a digit and the fraction bar beneath it stay separate */
+function assembleSymbols(items, refH){
+  var syms = [];
+  items.forEach(function(it){
+    for(var i=0;i<syms.length;i++){
+      var s = syms[i];
+      var ovx = Math.min(it.b.x2, s.b.x2) - Math.max(it.b.x, s.b.x);
+      if(ovx <= 0.45*Math.min(it.b.w, s.b.w)) continue;
+      var ovy = Math.min(it.b.y2, s.b.y2) - Math.max(it.b.y, s.b.y);
+      if(ovy > 0 || (isFlatBox(it.b) && isFlatBox(s.b)) || -ovy < 0.12*refH){
+        s.items.push(it); s.b = unionBox(s.b, it.b); return;
+      }
+    }
+    syms.push({items:[it], b:it.b});
+  });
+  syms.sort(function(a,b){ return a.b.x - b.b.x; });
+  return syms;
+}
+/* strokes to classified symbols */
+function buildSymbols(){
+  var ink = S.strokes.filter(function(st){ return !st.hl; });
+  if(!ink.length) return [];
+  var items = ink.map(function(st){ return {st:st, b:boxOf([st])}; });
+  var out = [];
+  clusterRows(items).forEach(function(L){
+    var refH = boxHeights(L.items);
+    var syms = assembleSymbols(L.items, refH);
+    fuseEquals(syms, refH);
+    refH = boxHeights(syms);
+    syms.forEach(function(s){
+      var c = classify(s, refH);
+      s.ch = c.ch; s.alts = c.list || []; s.firm = !!c.firm; s.xshape = !!c.xshape;
+      out.push(s);
     });
+  });
+  return out;
+}
+/* one side of a candidate fraction bar: the nearest cluster of symbols centred on it */
+function fracSide(syms, bar, dir){
+  var x1 = bar.x - bar.w*0.2, x2 = bar.x2 + bar.w*0.2, cands = [];
+  syms.forEach(function(s){
+    if(s.used || s.isBar) return;
+    var c = (s.b.x + s.b.x2)/2;
+    if(c < x1 || c > x2) return;
+    var gap = dir < 0 ? (bar.y - s.b.y2) : (s.b.y - bar.y2);
+    if(gap < 0) return;
+    cands.push({s:s, gap:gap, h:s.b.h});
   });
   if(!cands.length) return null;
   cands.sort(function(a,b){ return a.gap - b.gap; });
@@ -994,40 +1080,26 @@ function fracSide(rows, bar, row, dir){
   if(Math.abs((box.x+box.x2)/2 - (bar.x+bar.x2)/2) > bar.w*0.32) return null;
   return {list:list, box:box};
 }
-function buildFractions(rows){
-  var bars = [];
-  rows.forEach(function(L){
-    L.syms.forEach(function(s){
-      if(s.items.length !== 1 || s.frac) return;
-      if(s.b.w < 2.2*s.b.h || s.b.w < L.refH*0.5) return;
-      if(strokeInfo(s.items[0].st).straight < 0.85) return;
-      bars.push({s:s, row:L});
-    });
-  });
-  bars.sort(function(a,b){ return a.s.b.w - b.s.b.w; });
+function buildFractions(syms){
+  var refH = boxHeights(syms);
+  var bars = syms.filter(function(s){ return flatSym(s, refH) && s.b.w >= refH*0.5; });
+  bars.forEach(function(b){ b.isBar = true; });
+  bars.sort(function(a,b){ return a.b.w - b.b.w; });
   bars.forEach(function(B){
-    if(B.s.used) return;
-    var bar = B.s.b;
-    var num = fracSide(rows, bar, B.row, -1);
+    if(B.used) return;
+    var num = fracSide(syms, B.b, -1);
     if(!num) return;
-    var den = fracSide(rows, bar, B.row, 1);
+    var den = fracSide(syms, B.b, 1);
     if(!den) return;
     var node = {
-      frac:true, num:num.list, den:den.list, ch:'#',
-      b: unionBox(unionBox(bar, num.box), den.box)
+      frac:true, num:num.list, den:den.list, ch:'#', items:[],
+      b: unionBox(unionBox(B.b, num.box), den.box)
     };
     num.list.concat(den.list).forEach(function(s){ s.used = true; });
-    B.s.used = true;
-    var arr = B.row.syms, at = arr.indexOf(B.s);
-    if(at >= 0) arr[at] = node;
-    rows.forEach(function(L){
-      L.syms = L.syms.filter(function(s){ return s === node || !s.used; });
-    });
+    B.used = true;
+    syms.push(node);
   });
-  rows.forEach(function(L){
-    L.syms = L.syms.filter(function(s){ return !s.used; });
-    L.syms.sort(function(a,b){ return a.b.x - b.b.x; });
-  });
+  return syms.filter(function(s){ return !s.used; });
 }
 function setAnchor(grp){
   grp.lineH = refHeight(grp.symbols);
@@ -1040,12 +1112,13 @@ function setAnchor(grp){
   grp.baseline = bases.length ? bases[Math.floor(bases.length/2)] : grp.box.y2;
 }
 function segment(){
-  var rows = buildRows();
-  if(!rows.length) return [];
-  buildFractions(rows);
+  var syms = buildSymbols();
+  if(!syms.length) return [];
+  syms = buildFractions(syms);
   var groups = [];
-  rows.forEach(function(L){
-    var items = L.syms;
+  /* lines are worked out again now that each fraction is a single tall symbol */
+  clusterRows(syms).forEach(function(L){
+    var items = L.items;
     if(!items.length) return;
     var refH = refHeight(items);
     var cur = [], mine = [];
@@ -1079,7 +1152,6 @@ function segment(){
   });
   return groups;
 }
-
 /* ---------------- layout: symbols to expression ---------------- */
 function altNonLetter(s){
   var list = s.alts || [];
@@ -1176,7 +1248,10 @@ function place(grp, text, mark){
   if(text){
     ctx.save();
     ctx.font = '700 ' + size + 'px Caveat, "Segoe Script", cursive';
-    width += ctx.measureText(text).width + (mark === 'bad' ? h*0.9 : 0);
+    var m = ctx.measureText(text);
+    /* handwriting faces overhang their advance width, so trust the ink box when it is there */
+    var ink = m.actualBoundingBoxRight !== undefined ? Math.max(m.width, m.actualBoundingBoxRight) : m.width;
+    width += ink*1.04 + 4 + (mark === 'bad' ? h*0.9 : 0);
     ctx.restore();
   }
   var room = Math.min(grp.nextX, W) - x - h*0.25;
@@ -1242,7 +1317,8 @@ function updateHint(list){
   if(!hintEl) return;
   if(!list || !list.length){ hintEl.innerHTML = TIP; hintEl.hidden = S.strokes.length > 0; return; }
   hintEl.hidden = false;
-  hintEl.innerHTML = '<b>Ho letto</b> ' + list.slice(-3).map(function(x){
+  var keep = W < 560 ? 1 : 3;
+  hintEl.innerHTML = '<b>Ho letto</b> ' + list.slice(-keep).map(function(x){
     return '<code>' + x.replace(/\*/g, '×') + '</code>';
   }).join(' · ');
 }
@@ -1352,11 +1428,14 @@ var DEMO = [
   [[214,43],[234,43],[252,43]]
 ];
 function seed(){
-  var ox = Math.max(96, Math.min(W*0.14, 240)), oy = Math.max(70, Math.min(H*0.26, 220));
+  var ox = Math.max(24, Math.min(W*0.14, 240)), oy = Math.max(60, Math.min(H*0.24, 210));
+  /* shrink the example on a narrow board, leaving room for the answer */
+  var s = Math.min(1, (W - ox - Math.max(90, W*0.3)) / 252);
+  if(s < 0.45) return;
   DEMO.forEach(function(path){
     S.strokes.push({
       id:nid(), color:'ink', w:3, hl:0,
-      pts:path.map(function(q){ return {x:ox+q[0], y:oy+q[1]}; })
+      pts:path.map(function(q){ return {x:ox + q[0]*s, y:oy + q[1]*s}; })
     });
   });
   cacheDirty = true;

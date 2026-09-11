@@ -19,12 +19,20 @@ Se il risultato l'hai già scritto tu, viene controllato: ✓ se torna, altrimen
 
 La riga in basso mostra sempre **cosa ha letto**, così una svista del riconoscimento si vede subito.
 
+## Su telefono
+
+Funziona a dito: l'uguale viene riconosciuto anche quando le due barrette finiscono
+sfalsate, inclinate, di lunghezza diversa o scritte sotto la riga delle cifre.
+La riga di lettura resta visibile anche sullo schermo stretto, ed e' l'unico modo
+per accorgersi al volo di una lettura sbagliata.
+
 ## Come funziona
 
 Tutto gira nel browser, senza server e senza servizi esterni:
 
 - i tratti vengono raggruppati in righe di scrittura (vicinanza verticale *e* orizzontale,
-  così due colonne affiancate non si mescolano) e poi in simboli;
+  così due colonne affiancate non si mescolano) e poi in simboli; le righe vengono
+  ricalcolate dopo aver formato le frazioni, quando ogni frazione è ormai un simbolo unico;
 - ogni simbolo viene rasterizzato, assottigliato (Zhang-Suen) e confrontato con modelli
   generati a runtime dai font disponibili; il conteggio degli anelli chiusi separa 0/6/8/9 da 3/5/2;
 - `=`, `+`, `-`, `×`, `÷`, `1`, `(`, `)` e il punto sono riconosciuti prima per geometria;
